@@ -1,4 +1,4 @@
-﻿#requires -version 5.1
+#requires -version 5.1
 <#
 .SYNOPSIS
     Assistente de instalação e reinstalação do NotaJá.
@@ -33,15 +33,15 @@ $ErrorActionPreference = 'Stop'
 # URL RAW deste próprio script no GitHub.
 # Ela permite que o script se eleve novamente quando executado com:
 # irm "URL_RAW" | iex
-$RemoteScriptUrl = 'https://raw.githubusercontent.com/SEU_USUARIO/SEU_REPOSITORIO/main/NotaJa-Suporte.ps1'
+$RemoteScriptUrl = 'https://raw.githubusercontent.com/fiuzadan/nota/main/NotaJa-Suporte.ps1'
 
 # Recomenda-se hospedar o EXE como ativo de uma GitHub Release.
-$InstallerUrl = 'https://github.com/SEU_USUARIO/SEU_REPOSITORIO/releases/download/v5.10c/NotaJa.exe'
+$InstallerUrl = 'https://github.com/fiuzadan/nota/releases/latest/download/NotaJa.exe'
 
 # Opcional, mas altamente recomendado.
 # Gere com: Get-FileHash .\NotaJa.exe -Algorithm SHA256
 # Deixe vazio para apenas avisar e continuar.
-$ExpectedInstallerSha256 = ''
+$ExpectedInstallerSha256 = 'EA9F536F40C4F7DBDD341CDCB54BF5573F8F740028B793BD56C5E3F44F1A977A'
 
 # Mantém uma cópia dos componentes removidos em ProgramData.
 $BackupComponentsBeforeRemoval = $true
