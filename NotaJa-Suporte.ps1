@@ -512,7 +512,7 @@ function Unregister-OcxFile {
         Write-Log "Desregistro tentado para $FilePath. Código: $($Process.ExitCode)."
     }
     catch {
-        Write-Log "Falha ao desregistrar $FilePath: $($_.Exception.Message)" 'AVISO'
+        Write-Log "Falha ao desregistrar ${FilePath}: $($_.Exception.Message)" 'AVISO'
     }
 }
 
@@ -554,7 +554,7 @@ function Remove-LegacyComponents {
                 $Removed++
             }
             catch {
-                Write-Log "Não foi possível remover $FullPath: $($_.Exception.Message)" 'ERRO'
+                Write-Log "Não foi possível remover ${FullPath}: $($_.Exception.Message)" 'ERRO'
                 $Failed++
             }
         }
