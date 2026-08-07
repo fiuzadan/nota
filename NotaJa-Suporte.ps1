@@ -15,7 +15,7 @@
         4. Cria um backup completo da base em C:\NotaJaBackup\DPCOMPV-<data-hora>
         5. Renomeia C:\DPCOMPV para C:\DPCOMPVBKP
         6. Faz backup e remove somente os componentes listados de System32/SysWOW64
-        7. Usa C:\NotaJa.exe quando escolhido ou baixa do site oficial e executa o instalador
+        7. Usa o instalador já escolhido/baixado e validado no início da sessão
         8. Para o serviço MySQL
         9. Renomeia a nova C:\DPCOMPV para C:\DPCOMPVAZIO, DPCOMPVAZIO2 etc.
        10. Restaura C:\DPCOMPVBKP como C:\DPCOMPV e inicia o MySQL
@@ -55,7 +55,8 @@ $ExpectedInstallerSha256 = 'E3CB6B76ED9AB4AC5B715AD9059637DF50A0EF8A8CD186F5BF47
 # Mantém uma cópia dos componentes removidos em ProgramData.
 $BackupComponentsBeforeRemoval = $true
 
-# Exclui o instalador temporário depois de uma instalação bem-sucedida.
+# Quando falso, o instalador baixado é mantido durante toda a sessão e removido ao encerrar o assistente.
+# C:\NotaJa.exe nunca é removido pelo script.
 $KeepDownloadedInstaller = $false
 
 # ============================================================
@@ -68,6 +69,9 @@ $LogDirectory = Join-Path $env:ProgramData 'NotaJa-Suporte\Logs'
 $BackupRoot = Join-Path $env:ProgramData "NotaJa-Suporte\BackupComponentes\$TimeStamp"
 $InstallerPath = Join-Path $WorkDirectory 'NotaJa.exe'
 $SessionLog = Join-Path $LogDirectory "NotaJa-Suporte-$TimeStamp.log"
+
+# Instalador escolhido/baixado logo no início da sessão.
+$script:PreparedInstaller = $null
 
 # Pastas críticas que jamais devem ser excluídas pelo script.
 $NfeDirectory = 'C:\NFE'
@@ -472,14 +476,58 @@ function Get-NotaJaInstaller {
     }
 }
 
+function Initialize-InstallerSource {
+    Clear-Host
+    Write-Host '=============================================' -ForegroundColor Cyan
+    Write-Host '         INSTALADOR DO NOTAJÁ' -ForegroundColor Cyan
+    Write-Host '=============================================' -ForegroundColor Cyan
+    Write-Host
+
+    Write-Log "Verificando se existe instalador local em $LocalInstallerPath."
+
+    # Esta decisão acontece uma única vez, antes do menu principal e antes
+    # da escolha do tipo de instalação/reinstalação.
+    $script:PreparedInstaller = Get-NotaJaInstaller
+
+    Write-Host
+    Write-Host "Instalador preparado: $($script:PreparedInstaller.Source)" -ForegroundColor Green
+    Write-Log "Instalador preparado no início da sessão. Origem: $($script:PreparedInstaller.Source). Caminho: $($script:PreparedInstaller.Path)." 'OK'
+}
+
+function Remove-PreparedInstaller {
+    if ($null -eq $script:PreparedInstaller) {
+        return
+    }
+
+    # O arquivo local C:\NotaJa.exe nunca é removido.
+    if ($script:PreparedInstaller.IsTemporary -and -not $KeepDownloadedInstaller) {
+        $PreparedPath = $script:PreparedInstaller.Path
+
+        if (Test-Path -LiteralPath $PreparedPath -PathType Leaf) {
+            Remove-Item -LiteralPath $PreparedPath -Force -ErrorAction SilentlyContinue
+            Write-Log "Instalador temporário removido ao encerrar a sessão: $PreparedPath"
+        }
+    }
+
+    $script:PreparedInstaller = $null
+}
+
 function Invoke-NotaJaInstallation {
     param(
         [Parameter(Mandatory = $true)]
         [PSCustomObject]$Selection
     )
 
-    $Installer = Get-NotaJaInstaller
+    if ($null -eq $script:PreparedInstaller) {
+        throw 'O instalador não foi preparado no início da sessão.'
+    }
+
+    $Installer = $script:PreparedInstaller
     $SetupPath = $Installer.Path
+
+    if (-not (Test-Path -LiteralPath $SetupPath -PathType Leaf)) {
+        throw "O instalador selecionado no início da sessão não está mais disponível em: $SetupPath"
+    }
     $InstallLog = Join-Path $LogDirectory "Instalacao-$($Selection.Component)-$TimeStamp.log"
 
     $Arguments = @(
@@ -510,12 +558,8 @@ function Invoke-NotaJaInstallation {
     Write-Log 'Instalação concluída com código 0.' 'OK'
     Write-Log "Log do instalador: $InstallLog"
 
-    # Só apaga o arquivo que foi baixado para a pasta temporária.
-    # C:\NotaJa.exe nunca é removido pelo script.
-    if ($Installer.IsTemporary -and -not $KeepDownloadedInstaller) {
-        Remove-Item -LiteralPath $SetupPath -Force -ErrorAction SilentlyContinue
-        Write-Log 'Instalador temporário removido.'
-    }
+    # O instalador preparado no início é mantido durante toda a sessão.
+    # Se for temporário, será removido somente ao encerrar o assistente.
 }
 
 # ============================================================
@@ -1223,4 +1267,13 @@ Write-Log "Computador: $env:COMPUTERNAME"
 Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
 Write-Log "Log da sessão: $SessionLog"
 
-Show-MainMenu
+try {
+    # Primeira decisão operacional da sessão: localizar C:\NotaJa.exe.
+    # Se existir, pergunta se deve usá-lo ou baixar do site.
+    # Se não existir, baixa automaticamente. Só depois o menu principal é exibido.
+    Initialize-InstallerSource
+    Show-MainMenu
+}
+finally {
+    Remove-PreparedInstaller
+}
