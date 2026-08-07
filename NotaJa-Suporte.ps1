@@ -41,7 +41,7 @@ $InstallerUrl = 'https://github.com/fiuzadan/nota/releases/latest/download/NotaJ
 # Opcional, mas altamente recomendado.
 # Gere com: Get-FileHash .\NotaJa.exe -Algorithm SHA256
 # Deixe vazio para apenas avisar e continuar.
-$ExpectedInstallerSha256 = 'EA9F536F40C4F7DBDD341CDCB54BF5573F8F740028B793BD56C5E3F44F1A977A'
+$ExpectedInstallerSha256 = 'E3CB6B76ED9AB4AC5B715AD9059637DF50A0EF8A8CD186F5BF47ABFE907EB51A'
 
 # Mantém uma cópia dos componentes removidos em ProgramData.
 $BackupComponentsBeforeRemoval = $true
