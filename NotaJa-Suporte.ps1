@@ -11,10 +11,16 @@
     - Reinstalação:
         1. Encerra processos do NotaJá
         2. Executa o desinstalador Inno Setup
-        3. Faz backup e remove somente os componentes listados de System32/SysWOW64
-        4. Baixa e executa novamente o instalador
+        3. Confirma que C:\NFE e C:\DPCOMPV foram preservadas
+        4. Cria um backup completo da base em C:\NotaJaBackup\DPCOMPV-<data-hora>
+        5. Renomeia C:\DPCOMPV para C:\DPCOMPVBKP
+        6. Faz backup e remove somente os componentes listados de System32/SysWOW64
+        7. Usa C:\NotaJa.exe quando escolhido ou baixa do site oficial e executa o instalador
+        8. Para o serviço MySQL
+        9. Renomeia a nova C:\DPCOMPV para C:\DPCOMPVAZIO, DPCOMPVAZIO2 etc.
+       10. Restaura C:\DPCOMPVBKP como C:\DPCOMPV e inicia o MySQL
 
-    O script não remove C:\NFE nem apaga intencionalmente os dados do MySQL.
+    O script nunca remove C:\NFE, C:\DPCOMPV, C:\DPCOMPVBKP ou os backups em C:\NotaJaBackup.
 
 .NOTES
     Requer Windows PowerShell 5.1 e privilégios de administrador.
@@ -35,12 +41,15 @@ $ErrorActionPreference = 'Stop'
 # irm "URL_RAW" | iex
 $RemoteScriptUrl = 'https://raw.githubusercontent.com/fiuzadan/nota/main/NotaJa-Suporte.ps1'
 
-# Recomenda-se hospedar o EXE como ativo de uma GitHub Release.
-$InstallerUrl = 'https://github.com/fiuzadan/nota/releases/latest/download/NotaJa.exe'
+# Download direto da versão mais atual publicada no site oficial do NotaJá.
+$InstallerUrl = 'https://cliente.notaja.com.br/emissor-nota-fiscal-eletronica/download/NotaJa.exe'
 
-# Opcional, mas altamente recomendado.
-# Gere com: Get-FileHash .\NotaJa.exe -Algorithm SHA256
-# Deixe vazio para apenas avisar e continuar.
+# Se este arquivo existir, o script pergunta se deve usá-lo ou baixar do site.
+# Se não existir, o download do site é iniciado automaticamente.
+$LocalInstallerPath = 'C:\NotaJa.exe'
+
+# SHA-256 esperado da versão atual.
+# Gere com: Get-FileHash C:\NotaJa.exe -Algorithm SHA256
 $ExpectedInstallerSha256 = 'E3CB6B76ED9AB4AC5B715AD9059637DF50A0EF8A8CD186F5BF47ABFE907EB51A'
 
 # Mantém uma cópia dos componentes removidos em ProgramData.
@@ -59,6 +68,19 @@ $LogDirectory = Join-Path $env:ProgramData 'NotaJa-Suporte\Logs'
 $BackupRoot = Join-Path $env:ProgramData "NotaJa-Suporte\BackupComponentes\$TimeStamp"
 $InstallerPath = Join-Path $WorkDirectory 'NotaJa.exe'
 $SessionLog = Join-Path $LogDirectory "NotaJa-Suporte-$TimeStamp.log"
+
+# Pastas críticas que jamais devem ser excluídas pelo script.
+$NfeDirectory = 'C:\NFE'
+$DatabaseDirectory = 'C:\DPCOMPV'
+$DatabaseBackupDirectory = 'C:\DPCOMPVBKP'
+$EmptyDatabaseBaseDirectory = 'C:\DPCOMPVAZIO'
+$DatabaseSafetyBackupRoot = 'C:\NotaJaBackup'
+
+# Nomes mais comuns do serviço instalado pelo MySQL 5.6.
+$PreferredMySqlServiceNames = @(
+    'MySQL',
+    'MySQL56'
+)
 
 $ComponentFiles = @(
     'CFeSatDataSetX.dll',
@@ -293,16 +315,113 @@ function Test-Configuration {
     ) {
         throw 'Configure a variável $InstallerUrl no início do script antes de utilizá-lo.'
     }
+
+    if ([string]::IsNullOrWhiteSpace($LocalInstallerPath)) {
+        throw 'Configure a variável $LocalInstallerPath no início do script antes de utilizá-lo.'
+    }
+}
+
+function Test-NotaJaInstallerFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDescription,
+
+        [bool]$DeleteOnHashFailure = $false
+    )
+
+    if (
+        -not (Test-Path -LiteralPath $Path -PathType Leaf) -or
+        (Get-Item -LiteralPath $Path).Length -le 0
+    ) {
+        throw "O instalador de $SourceDescription não é um arquivo válido: $Path"
+    }
+
+    $FileLengthMb = [Math]::Round(
+        (Get-Item -LiteralPath $Path).Length / 1MB,
+        2
+    )
+
+    Write-Log "Instalador selecionado: $SourceDescription ($FileLengthMb MB)."
+
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedInstallerSha256)) {
+        $ExpectedHash = $ExpectedInstallerSha256.Replace(' ', '').ToUpperInvariant()
+        $ActualHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
+
+        if ($ActualHash -ne $ExpectedHash) {
+            if ($DeleteOnHashFailure) {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            }
+
+            throw "O SHA-256 do instalador não confere. Esperado: $ExpectedHash | Obtido: $ActualHash"
+        }
+
+        Write-Log 'SHA-256 do instalador conferido com sucesso.' 'OK'
+    }
+    else {
+        Write-Log 'SHA-256 não configurado. O instalador será executado sem validação de hash.' 'AVISO'
+    }
+
+    try {
+        $Signature = Get-AuthenticodeSignature -LiteralPath $Path
+
+        if ($Signature.Status -eq 'Valid') {
+            Write-Log "Assinatura digital válida: $($Signature.SignerCertificate.Subject)" 'OK'
+        }
+        else {
+            Write-Log "Assinatura digital do instalador: $($Signature.Status)." 'AVISO'
+        }
+    }
+    catch {
+        Write-Log "Não foi possível consultar a assinatura digital: $($_.Exception.Message)" 'AVISO'
+    }
 }
 
 function Get-NotaJaInstaller {
     Test-Configuration
 
+    # Se houver um instalador em C:\NotaJa.exe, deixa o técnico escolher.
+    if (Test-Path -LiteralPath $LocalInstallerPath -PathType Leaf) {
+        Write-Host ''
+        Write-Host "Instalador local encontrado em: $LocalInstallerPath" -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '1 - Usar o instalador local'
+        Write-Host '2 - Baixar a versão mais atual do site do NotaJá'
+        Write-Host ''
+
+        do {
+            $InstallerChoice = (Read-Host 'Escolha 1 ou 2').Trim()
+        } until ($InstallerChoice -in @('1', '2'))
+
+        if ($InstallerChoice -eq '1') {
+            Write-Log "Utilizando o instalador local: $LocalInstallerPath"
+
+            Test-NotaJaInstallerFile `
+                -Path $LocalInstallerPath `
+                -SourceDescription 'arquivo local' `
+                -DeleteOnHashFailure $false
+
+            return [PSCustomObject]@{
+                Path        = $LocalInstallerPath
+                IsTemporary = $false
+                Source      = 'Arquivo local'
+            }
+        }
+
+        Write-Log 'O arquivo local foi ignorado por escolha do usuário. Será feito download do site oficial.'
+    }
+    else {
+        Write-Log "Nenhum instalador local encontrado em $LocalInstallerPath. O download será iniciado automaticamente."
+    }
+
+    # Download para a pasta temporária. O arquivo local, se existir, nunca é alterado.
     if (Test-Path -LiteralPath $InstallerPath) {
         Remove-Item -LiteralPath $InstallerPath -Force
     }
 
-    Write-Log "Baixando o instalador: $InstallerUrl"
+    Write-Log "Baixando o instalador do site oficial: $InstallerUrl"
 
     try {
         Invoke-WebRequest `
@@ -328,7 +447,7 @@ function Get-NotaJaInstaller {
     }
 
     if (
-        -not (Test-Path -LiteralPath $InstallerPath) -or
+        -not (Test-Path -LiteralPath $InstallerPath -PathType Leaf) -or
         (Get-Item -LiteralPath $InstallerPath).Length -le 0
     ) {
         throw 'O instalador não foi baixado corretamente.'
@@ -341,36 +460,16 @@ function Get-NotaJaInstaller {
 
     Write-Log "Download concluído: $FileLengthMb MB." 'OK'
 
-    if (-not [string]::IsNullOrWhiteSpace($ExpectedInstallerSha256)) {
-        $ExpectedHash = $ExpectedInstallerSha256.Replace(' ', '').ToUpperInvariant()
-        $ActualHash = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToUpperInvariant()
+    Test-NotaJaInstallerFile `
+        -Path $InstallerPath `
+        -SourceDescription 'download do site oficial' `
+        -DeleteOnHashFailure $true
 
-        if ($ActualHash -ne $ExpectedHash) {
-            Remove-Item -LiteralPath $InstallerPath -Force -ErrorAction SilentlyContinue
-            throw "O SHA-256 do instalador não confere. Esperado: $ExpectedHash | Obtido: $ActualHash"
-        }
-
-        Write-Log 'SHA-256 do instalador conferido com sucesso.' 'OK'
+    return [PSCustomObject]@{
+        Path        = $InstallerPath
+        IsTemporary = $true
+        Source      = 'Site oficial'
     }
-    else {
-        Write-Log 'SHA-256 não configurado. O instalador será executado sem validação de hash.' 'AVISO'
-    }
-
-    try {
-        $Signature = Get-AuthenticodeSignature -LiteralPath $InstallerPath
-
-        if ($Signature.Status -eq 'Valid') {
-            Write-Log "Assinatura digital válida: $($Signature.SignerCertificate.Subject)" 'OK'
-        }
-        else {
-            Write-Log "Assinatura digital do instalador: $($Signature.Status)." 'AVISO'
-        }
-    }
-    catch {
-        Write-Log "Não foi possível consultar a assinatura digital: $($_.Exception.Message)" 'AVISO'
-    }
-
-    return $InstallerPath
 }
 
 function Invoke-NotaJaInstallation {
@@ -379,7 +478,8 @@ function Invoke-NotaJaInstallation {
         [PSCustomObject]$Selection
     )
 
-    $SetupPath = Get-NotaJaInstaller
+    $Installer = Get-NotaJaInstaller
+    $SetupPath = $Installer.Path
     $InstallLog = Join-Path $LogDirectory "Instalacao-$($Selection.Component)-$TimeStamp.log"
 
     $Arguments = @(
@@ -395,6 +495,7 @@ function Invoke-NotaJaInstallation {
 
     Write-Log "Iniciando instalação: $($Selection.Label)."
     Write-Log "Componente interno: $($Selection.Component)."
+    Write-Log "Origem do instalador: $($Installer.Source)."
 
     $Process = Start-Process `
         -FilePath $SetupPath `
@@ -409,9 +510,420 @@ function Invoke-NotaJaInstallation {
     Write-Log 'Instalação concluída com código 0.' 'OK'
     Write-Log "Log do instalador: $InstallLog"
 
-    if (-not $KeepDownloadedInstaller) {
+    # Só apaga o arquivo que foi baixado para a pasta temporária.
+    # C:\NotaJa.exe nunca é removido pelo script.
+    if ($Installer.IsTemporary -and -not $KeepDownloadedInstaller) {
         Remove-Item -LiteralPath $SetupPath -Force -ErrorAction SilentlyContinue
         Write-Log 'Instalador temporário removido.'
+    }
+}
+
+# ============================================================
+# PROTEÇÃO E TROCA DA BASE LOCAL
+# ============================================================
+
+function Test-ProtectedFoldersBeforeReinstallation {
+    if (-not (Test-Path -LiteralPath $NfeDirectory -PathType Container)) {
+        throw "A pasta protegida $NfeDirectory não foi encontrada. A reinstalação foi bloqueada para evitar perda de dados."
+    }
+
+    $DatabaseExists = Test-Path -LiteralPath $DatabaseDirectory -PathType Container
+    $BackupExists = Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container
+
+    if ($DatabaseExists -and $BackupExists) {
+        throw "As pastas $DatabaseDirectory e $DatabaseBackupDirectory já existem ao mesmo tempo. A reinstalação foi bloqueada para não sobrescrever nenhuma base."
+    }
+
+    if (-not $DatabaseExists -and -not $BackupExists) {
+        throw "Nem $DatabaseDirectory nem $DatabaseBackupDirectory foram encontradas. A reinstalação foi bloqueada para evitar perda da base local."
+    }
+
+    if ($BackupExists -and -not $DatabaseExists) {
+        Write-Log "Foi encontrada $DatabaseBackupDirectory sem $DatabaseDirectory. O script tratará isso como uma reinstalação anterior interrompida." 'AVISO'
+    }
+
+    Write-Log "Pasta protegida confirmada: $NfeDirectory" 'OK'
+}
+
+function Test-ProtectedFoldersAfterUninstall {
+    if (-not (Test-Path -LiteralPath $NfeDirectory -PathType Container)) {
+        throw "A pasta protegida $NfeDirectory não foi encontrada após a desinstalação. O processo foi interrompido."
+    }
+
+    if (
+        -not (Test-Path -LiteralPath $DatabaseDirectory -PathType Container) -and
+        -not (Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container)
+    ) {
+        throw "A base local não foi encontrada após a desinstalação: $DatabaseDirectory / $DatabaseBackupDirectory. O processo foi interrompido."
+    }
+
+    Write-Log 'As pastas protegidas permaneceram disponíveis após a desinstalação.' 'OK'
+}
+
+function Get-UniqueDatabaseSafetyBackupDirectory {
+    $BaseName = "DPCOMPV-$TimeStamp"
+    $Candidate = Join-Path $DatabaseSafetyBackupRoot $BaseName
+
+    if (-not (Test-Path -LiteralPath $Candidate)) {
+        return $Candidate
+    }
+
+    $Index = 2
+
+    while ($true) {
+        $Candidate = Join-Path $DatabaseSafetyBackupRoot ("{0}-{1}" -f $BaseName, $Index)
+
+        if (-not (Test-Path -LiteralPath $Candidate)) {
+            return $Candidate
+        }
+
+        $Index++
+    }
+}
+
+function Backup-DatabaseBeforeReinstallation {
+    $SourceDirectory = $null
+
+    if (Test-Path -LiteralPath $DatabaseDirectory -PathType Container) {
+        $SourceDirectory = $DatabaseDirectory
+    }
+    elseif (Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container) {
+        # Permite recuperar com segurança uma reinstalação anterior interrompida.
+        $SourceDirectory = $DatabaseBackupDirectory
+        Write-Log "$DatabaseDirectory não existe. O backup de segurança será feito a partir de $DatabaseBackupDirectory." 'AVISO'
+    }
+    else {
+        throw 'Não existe uma pasta de base local disponível para gerar o backup de segurança.'
+    }
+
+    New-Item -ItemType Directory -Path $DatabaseSafetyBackupRoot -Force | Out-Null
+    $DestinationDirectory = Get-UniqueDatabaseSafetyBackupDirectory
+
+    Write-Log "Criando backup completo da base antes de continuar: $SourceDirectory -> $DestinationDirectory"
+
+    $RoboCopyPath = Join-Path $env:SystemRoot 'System32\robocopy.exe'
+
+    if (Test-Path -LiteralPath $RoboCopyPath) {
+        New-Item -ItemType Directory -Path $DestinationDirectory -Force | Out-Null
+
+        $RoboArguments = @(
+            "`"$SourceDirectory`"",
+            "`"$DestinationDirectory`"",
+            '/E',
+            '/COPY:DAT',
+            '/DCOPY:T',
+            '/R:2',
+            '/W:2',
+            '/XJ',
+            '/NP',
+            '/NFL',
+            '/NDL'
+        ) -join ' '
+
+        $Process = Start-Process `
+            -FilePath $RoboCopyPath `
+            -ArgumentList $RoboArguments `
+            -Wait `
+            -PassThru `
+            -WindowStyle Hidden
+
+        # Códigos 0 a 7 do Robocopy indicam sucesso ou sucesso com diferenças/cópias.
+        if ($Process.ExitCode -ge 8) {
+            throw "O backup da base falhou. Robocopy retornou código $($Process.ExitCode). A reinstalação foi interrompida antes de alterar a pasta original."
+        }
+    }
+    else {
+        Write-Log 'Robocopy não encontrado. Utilizando Copy-Item para o backup da base.' 'AVISO'
+        Copy-Item `
+            -LiteralPath $SourceDirectory `
+            -Destination $DestinationDirectory `
+            -Recurse `
+            -Force `
+            -ErrorAction Stop
+    }
+
+    if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
+        throw 'Não foi possível confirmar a criação do backup da base. A reinstalação foi interrompida.'
+    }
+
+    $BackupHasContent = @(Get-ChildItem -LiteralPath $DestinationDirectory -Force -ErrorAction Stop).Count -gt 0
+
+    if (-not $BackupHasContent) {
+        throw "O backup foi criado em $DestinationDirectory, mas está vazio. A reinstalação foi interrompida antes de alterar a base original."
+    }
+
+    Write-Log "Backup de segurança da base concluído: $DestinationDirectory" 'OK'
+    return $DestinationDirectory
+}
+
+function Move-DatabaseToBackup {
+    $DatabaseExists = Test-Path -LiteralPath $DatabaseDirectory -PathType Container
+    $BackupExists = Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container
+
+    if ($BackupExists -and -not $DatabaseExists) {
+        Write-Log "$DatabaseBackupDirectory já existe e $DatabaseDirectory não existe. Mantendo o backup existente." 'AVISO'
+        return
+    }
+
+    if ($BackupExists) {
+        throw "Não é possível renomear a base: $DatabaseBackupDirectory já existe. Nenhuma pasta será sobrescrita."
+    }
+
+    if (-not $DatabaseExists) {
+        throw "A pasta $DatabaseDirectory não foi encontrada para ser preservada."
+    }
+
+    Write-Log "Renomeando $DatabaseDirectory para $DatabaseBackupDirectory."
+    Move-Item -LiteralPath $DatabaseDirectory -Destination $DatabaseBackupDirectory -ErrorAction Stop
+
+    if (
+        (Test-Path -LiteralPath $DatabaseDirectory) -or
+        -not (Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container)
+    ) {
+        throw 'Não foi possível confirmar a criação do backup da pasta DPCOMPV.'
+    }
+
+    Write-Log "Base local preservada em: $DatabaseBackupDirectory" 'OK'
+}
+
+function Get-UniqueEmptyDatabaseDirectory {
+    if (-not (Test-Path -LiteralPath $EmptyDatabaseBaseDirectory)) {
+        return $EmptyDatabaseBaseDirectory
+    }
+
+    $Index = 2
+
+    while ($true) {
+        $Candidate = "${EmptyDatabaseBaseDirectory}$Index"
+
+        if (-not (Test-Path -LiteralPath $Candidate)) {
+            return $Candidate
+        }
+
+        $Index++
+    }
+}
+
+function Get-NotaJaMySqlService {
+    foreach ($ServiceName in $PreferredMySqlServiceNames) {
+        $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+
+        if ($Service) {
+            return $Service
+        }
+    }
+
+    $ServiceDetails = @()
+
+    try {
+        $ServiceDetails = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop |
+            Where-Object {
+                $_.Name -match '(?i)mysql' -or
+                $_.DisplayName -match '(?i)mysql'
+            }
+    }
+    catch {
+        try {
+            $ServiceDetails = Get-WmiObject -Class Win32_Service -ErrorAction Stop |
+                Where-Object {
+                    $_.Name -match '(?i)mysql' -or
+                    $_.DisplayName -match '(?i)mysql'
+                }
+        }
+        catch {
+            Write-Log "Não foi possível consultar os detalhes dos serviços MySQL: $($_.Exception.Message)" 'AVISO'
+        }
+    }
+
+    $DpcompvServices = @(
+        $ServiceDetails | Where-Object { $_.PathName -match '(?i)DPCOMPV' }
+    )
+
+    if ($DpcompvServices.Count -eq 1) {
+        return Get-Service -Name $DpcompvServices[0].Name -ErrorAction Stop
+    }
+
+    $AllMySqlServices = @(
+        Get-Service -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match '(?i)mysql' -or
+                $_.DisplayName -match '(?i)mysql'
+            }
+    )
+
+    if ($AllMySqlServices.Count -eq 1) {
+        return $AllMySqlServices[0]
+    }
+
+    if ($AllMySqlServices.Count -gt 1) {
+        $Names = ($AllMySqlServices | ForEach-Object { $_.Name }) -join ', '
+        throw "Foram encontrados vários serviços MySQL ($Names), mas não foi possível identificar com segurança qual pertence ao NotaJá."
+    }
+
+    throw 'O serviço MySQL do NotaJá não foi encontrado após a instalação.'
+}
+
+function Stop-NotaJaMySqlService {
+    $Service = Get-NotaJaMySqlService
+    $ServiceName = $Service.Name
+
+    if ($Service.Status -ne 'Stopped') {
+        Write-Log "Parando o serviço MySQL: $ServiceName."
+        Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+
+        $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+        $Service.WaitForStatus(
+            [ServiceProcess.ServiceControllerStatus]::Stopped,
+            (New-TimeSpan -Seconds 60)
+        )
+    }
+
+    $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+
+    if ($Service.Status -ne 'Stopped') {
+        throw "O serviço $ServiceName não parou dentro do tempo esperado."
+    }
+
+    Write-Log "Serviço MySQL parado: $ServiceName." 'OK'
+    return $ServiceName
+}
+
+function Start-NotaJaMySqlService {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName
+    )
+
+    $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+
+    if ($Service.Status -ne 'Running') {
+        Write-Log "Iniciando o serviço MySQL: $ServiceName."
+        Start-Service -Name $ServiceName -ErrorAction Stop
+
+        $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+        $Service.WaitForStatus(
+            [ServiceProcess.ServiceControllerStatus]::Running,
+            (New-TimeSpan -Seconds 60)
+        )
+    }
+
+    $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+
+    if ($Service.Status -ne 'Running') {
+        throw "O serviço $ServiceName não iniciou dentro do tempo esperado."
+    }
+
+    Write-Log "Serviço MySQL iniciado: $ServiceName." 'OK'
+}
+
+function Restore-OriginalDatabase {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceName
+    )
+
+    if (-not (Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container)) {
+        throw "A pasta de backup $DatabaseBackupDirectory não foi encontrada."
+    }
+
+    if (-not (Test-Path -LiteralPath $DatabaseDirectory -PathType Container)) {
+        throw "A nova pasta $DatabaseDirectory não foi criada pela instalação."
+    }
+
+    $EmptyDirectory = Get-UniqueEmptyDatabaseDirectory
+
+    Write-Log "Renomeando a nova pasta $DatabaseDirectory para $EmptyDirectory."
+    Move-Item -LiteralPath $DatabaseDirectory -Destination $EmptyDirectory -ErrorAction Stop
+
+    try {
+        Write-Log "Restaurando $DatabaseBackupDirectory como $DatabaseDirectory."
+        Move-Item -LiteralPath $DatabaseBackupDirectory -Destination $DatabaseDirectory -ErrorAction Stop
+    }
+    catch {
+        Write-Log 'Falha ao restaurar a base original. Tentando recolocar a pasta nova no caminho DPCOMPV.' 'ERRO'
+
+        if (
+            -not (Test-Path -LiteralPath $DatabaseDirectory) -and
+            (Test-Path -LiteralPath $EmptyDirectory -PathType Container)
+        ) {
+            Move-Item -LiteralPath $EmptyDirectory -Destination $DatabaseDirectory -ErrorAction SilentlyContinue
+        }
+
+        throw
+    }
+
+    Write-Log "Nova base vazia preservada em: $EmptyDirectory" 'OK'
+    Write-Log "Base original restaurada em: $DatabaseDirectory" 'OK'
+
+    Start-NotaJaMySqlService -ServiceName $ServiceName
+}
+
+function Repair-DatabaseFoldersAfterFailure {
+    param(
+        [string]$ServiceName
+    )
+
+    if (-not (Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container)) {
+        if (
+            $ServiceName -and
+            (Test-Path -LiteralPath $DatabaseDirectory -PathType Container)
+        ) {
+            try {
+                Start-NotaJaMySqlService -ServiceName $ServiceName
+            }
+            catch {
+                Write-Log "A base original está em $DatabaseDirectory, mas o serviço MySQL não iniciou: $($_.Exception.Message)" 'ERRO'
+            }
+        }
+
+        return
+    }
+
+    Write-Log 'Foi detectada uma falha com a base preservada em DPCOMPVBKP. Iniciando tentativa de recuperação.' 'AVISO'
+
+    if ($ServiceName) {
+        try {
+            $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+
+            if ($Service -and $Service.Status -ne 'Stopped') {
+                Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 2
+            }
+        }
+        catch {
+            Write-Log "Não foi possível parar o serviço durante a recuperação: $($_.Exception.Message)" 'AVISO'
+        }
+    }
+
+    if (Test-Path -LiteralPath $DatabaseDirectory -PathType Container) {
+        $RecoveryEmptyDirectory = Get-UniqueEmptyDatabaseDirectory
+
+        try {
+            Move-Item -LiteralPath $DatabaseDirectory -Destination $RecoveryEmptyDirectory -ErrorAction Stop
+            Write-Log "Pasta DPCOMPV gerada durante a tentativa foi preservada em: $RecoveryEmptyDirectory" 'AVISO'
+        }
+        catch {
+            Write-Log "Não foi possível liberar $DatabaseDirectory durante a recuperação: $($_.Exception.Message)" 'ERRO'
+            return
+        }
+    }
+
+    try {
+        Move-Item -LiteralPath $DatabaseBackupDirectory -Destination $DatabaseDirectory -ErrorAction Stop
+        Write-Log 'A base original foi restaurada automaticamente após a falha.' 'OK'
+    }
+    catch {
+        Write-Log "Não foi possível restaurar automaticamente a base original: $($_.Exception.Message)" 'ERRO'
+        return
+    }
+
+    if ($ServiceName) {
+        try {
+            Start-NotaJaMySqlService -ServiceName $ServiceName
+        }
+        catch {
+            Write-Log "A base foi restaurada, mas o serviço MySQL não iniciou: $($_.Exception.Message)" 'ERRO'
+        }
     }
 }
 
@@ -584,11 +1096,16 @@ function Invoke-Reinstallation {
     Write-Host '=============================================' -ForegroundColor Red
     Write-Host
     Write-Host 'Este procedimento irá:' -ForegroundColor Yellow
+    Write-Host ' - Preservar obrigatoriamente C:\NFE e a base C:\DPCOMPV'
     Write-Host ' - Desinstalar o NotaJá silenciosamente'
+    Write-Host ' - Fazer um backup completo de C:\DPCOMPV em C:\NotaJaBackup'
+    Write-Host ' - Renomear a base atual para C:\DPCOMPVBKP'
     Write-Host ' - Remover somente os componentes informados de System32/SysWOW64'
     Write-Host ' - Baixar e executar novamente o instalador'
+    Write-Host ' - Parar o MySQL, guardar a base nova como DPCOMPVAZIO e restaurar a base original'
     Write-Host
-    Write-Host 'O script NÃO remove C:\NFE nem apaga intencionalmente os dados do MySQL.' -ForegroundColor Green
+    Write-Host 'O script NÃO exclui C:\NFE, C:\DPCOMPV ou C:\DPCOMPVBKP.' -ForegroundColor Green
+    Write-Host 'Se já existir DPCOMPVBKP, nenhuma pasta será sobrescrita.' -ForegroundColor Green
     Write-Host 'Os componentes removidos podem ser compartilhados por outros sistemas da TecnoSpeed.' -ForegroundColor Yellow
     Write-Host
 
@@ -604,10 +1121,40 @@ function Invoke-Reinstallation {
         return
     }
 
+    $MySqlServiceName = $null
+    $DatabaseWasMoved = $false
+
+    Test-ProtectedFoldersBeforeReinstallation
     Stop-NotaJaApplications
-    Invoke-NotaJaUninstall
-    Remove-LegacyComponents
-    Invoke-NotaJaInstallation -Selection $Selection
+
+    try {
+        Invoke-NotaJaUninstall
+        Test-ProtectedFoldersAfterUninstall
+
+        $DatabaseSafetyBackupPath = Backup-DatabaseBeforeReinstallation
+        Write-Log "Backup independente confirmado antes da troca da base: $DatabaseSafetyBackupPath" 'OK'
+
+        Move-DatabaseToBackup
+        $DatabaseWasMoved = $true
+
+        Remove-LegacyComponents
+        Invoke-NotaJaInstallation -Selection $Selection
+
+        $MySqlServiceName = Stop-NotaJaMySqlService
+        Restore-OriginalDatabase -ServiceName $MySqlServiceName
+        $DatabaseWasMoved = $false
+
+        Write-Log 'Reinstalação e restauração da base concluídas com sucesso.' 'OK'
+    }
+    catch {
+        $OriginalError = $_
+
+        if ($DatabaseWasMoved -or (Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container)) {
+            Repair-DatabaseFoldersAfterFailure -ServiceName $MySqlServiceName
+        }
+
+        throw $OriginalError
+    }
 }
 
 # ============================================================
