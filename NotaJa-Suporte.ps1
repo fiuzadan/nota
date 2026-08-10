@@ -10,9 +10,10 @@
         instalarmysql = banco de dados local (MySQL 5.6)
     - Reinstalação:
         1. Encerra processos do NotaJá
-        2. Executa o desinstalador Inno Setup
-        3. Confirma que C:\NFE e C:\DPCOMPV foram preservadas
-        4. Cria um backup completo da base em C:\NotaJaBackup\DPCOMPV-<data-hora>
+        2. Protege C:\NFE temporariamente como C:\NFEBKP para o desinstalador não tocar em seu conteúdo
+        3. Executa o desinstalador Inno Setup e restaura C:\NFEBKP para C:\NFE
+        4. Confirma que C:\NFE e C:\DPCOMPV foram preservadas
+        5. Cria um backup completo da base em C:\NotaJa-Suporte\Backups\Base\DPCOMPV-<data-hora>
         5. Renomeia C:\DPCOMPV para C:\DPCOMPVBKP
         6. Faz backup e remove somente os componentes listados de System32/SysWOW64
         7. Usa o instalador já escolhido/baixado e validado no início da sessão
@@ -20,7 +21,8 @@
         9. Renomeia a nova C:\DPCOMPV para C:\DPCOMPVAZIO, DPCOMPVAZIO2 etc.
        10. Restaura C:\DPCOMPVBKP como C:\DPCOMPV e inicia o MySQL
 
-    O script nunca remove C:\NFE, C:\DPCOMPV, C:\DPCOMPVBKP ou os backups em C:\NotaJaBackup.
+    O script nunca remove C:\NFE, C:\DPCOMPV ou C:\DPCOMPVBKP.
+    Logs, backups permanentes e arquivos temporários ficam organizados em C:\NotaJa-Suporte.
 
 .NOTES
     Requer Windows PowerShell 5.1 e privilégios de administrador.
@@ -52,7 +54,7 @@ $LocalInstallerPath = 'C:\NotaJa.exe'
 # Gere com: Get-FileHash C:\NotaJa.exe -Algorithm SHA256
 $ExpectedInstallerSha256 = 'E3CB6B76ED9AB4AC5B715AD9059637DF50A0EF8A8CD186F5BF47ABFE907EB51A'
 
-# Mantém uma cópia dos componentes removidos em ProgramData.
+# Mantém uma cópia dos componentes removidos em C:\NotaJa-Suporte\Backups\Componentes.
 $BackupComponentsBeforeRemoval = $true
 
 # Quando falso, o instalador baixado é mantido durante toda a sessão e removido ao encerrar o assistente.
@@ -64,9 +66,16 @@ $KeepDownloadedInstaller = $false
 # ============================================================
 
 $TimeStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$WorkDirectory = Join-Path $env:TEMP 'NotaJa-Suporte'
-$LogDirectory = Join-Path $env:ProgramData 'NotaJa-Suporte\Logs'
-$BackupRoot = Join-Path $env:ProgramData "NotaJa-Suporte\BackupComponentes\$TimeStamp"
+
+# Toda a estrutura de suporte fica centralizada aqui.
+$SupportRoot = 'C:\NotaJa-Suporte'
+$LogDirectory = Join-Path $SupportRoot 'Logs'
+$BackupDirectoryRoot = Join-Path $SupportRoot 'Backups'
+$DatabaseSafetyBackupRoot = Join-Path $BackupDirectoryRoot 'Base'
+$ComponentBackupRoot = Join-Path $BackupDirectoryRoot 'Componentes'
+$BackupRoot = Join-Path $ComponentBackupRoot $TimeStamp
+$WorkDirectory = Join-Path $SupportRoot "Temp\$TimeStamp"
+
 $InstallerPath = Join-Path $WorkDirectory 'NotaJa.exe'
 $SessionLog = Join-Path $LogDirectory "NotaJa-Suporte-$TimeStamp.log"
 
@@ -75,10 +84,10 @@ $script:PreparedInstaller = $null
 
 # Pastas críticas que jamais devem ser excluídas pelo script.
 $NfeDirectory = 'C:\NFE'
+$NfeBackupDirectory = 'C:\NFEBKP'
 $DatabaseDirectory = 'C:\DPCOMPV'
 $DatabaseBackupDirectory = 'C:\DPCOMPVBKP'
 $EmptyDatabaseBaseDirectory = 'C:\DPCOMPVAZIO'
-$DatabaseSafetyBackupRoot = 'C:\NotaJaBackup'
 
 # Nomes mais comuns do serviço instalado pelo MySQL 5.6.
 $PreferredMySqlServiceNames = @(
@@ -157,8 +166,13 @@ $NotaJaProcesses = @(
 # ============================================================
 
 function Initialize-Environment {
-    New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
+    # Cria toda a estrutura centralizada do suporte.
+    New-Item -ItemType Directory -Path $SupportRoot -Force | Out-Null
     New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $BackupDirectoryRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $DatabaseSafetyBackupRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $ComponentBackupRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $WorkDirectory -Force | Out-Null
 
     try {
         [Net.ServicePointManager]::SecurityProtocol =
@@ -510,6 +524,21 @@ function Remove-PreparedInstaller {
     }
 
     $script:PreparedInstaller = $null
+
+    # Remove apenas a pasta temporária desta sessão se estiver vazia.
+    # Backups e logs nunca são removidos automaticamente.
+    if (Test-Path -LiteralPath $WorkDirectory -PathType Container) {
+        try {
+            $RemainingItems = @(Get-ChildItem -LiteralPath $WorkDirectory -Force -ErrorAction Stop)
+
+            if ($RemainingItems.Count -eq 0) {
+                Remove-Item -LiteralPath $WorkDirectory -Force -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            Write-Log "Não foi possível limpar a pasta temporária da sessão: $($_.Exception.Message)" 'AVISO'
+        }
+    }
 }
 
 function Invoke-NotaJaInstallation {
@@ -532,7 +561,7 @@ function Invoke-NotaJaInstallation {
 
     $Arguments = @(
         '/SP-',
-        '/VERYSILENT',
+        '/SILENT',
         '/SUPPRESSMSGBOXES',
         '/NORESTART',
         '/CLOSEAPPLICATIONS',
@@ -544,6 +573,9 @@ function Invoke-NotaJaInstallation {
     Write-Log "Iniciando instalação: $($Selection.Label)."
     Write-Log "Componente interno: $($Selection.Component)."
     Write-Log "Origem do instalador: $($Installer.Source)."
+    Write-Log 'A janela nativa de progresso do instalador será exibida durante a instalação.'
+    Write-Host
+    Write-Host 'Instalação em andamento. A janela de progresso do NotaJá será exibida.' -ForegroundColor Cyan
 
     $Process = Start-Process `
         -FilePath $SetupPath `
@@ -551,11 +583,50 @@ function Invoke-NotaJaInstallation {
         -Wait `
         -PassThru
 
-    if ($Process.ExitCode -ne 0) {
-        throw "O instalador terminou com o código $($Process.ExitCode). Consulte: $InstallLog"
+    $SetupExitCode = $Process.ExitCode
+
+    if ($SetupExitCode -ne 0) {
+        # Este instalador específico já foi observado concluindo todas as etapas e, ainda assim,
+        # fazendo o processo pai retornar código 1. Para não confundir isso com sucesso real,
+        # somente o código 1 pode ser aceito mediante validações pós-instalação rigorosas.
+        $LogLooksComplete = $false
+
+        if (Test-Path -LiteralPath $InstallLog -PathType Leaf) {
+            try {
+                $InstallLogContent = Get-Content -LiteralPath $InstallLog -Raw -ErrorAction Stop
+                $LogLooksComplete = (
+                    $InstallLogContent -match 'Installation process succeeded\.' -and
+                    $InstallLogContent -match 'Deinitializing Setup\.'
+                )
+            }
+            catch {
+                Write-Log "Não foi possível analisar o log do instalador após o código $SetupExitCode: $($_.Exception.Message)" 'AVISO'
+            }
+        }
+
+        $UninstallerPresent = [bool](Get-UninstallerPath)
+        $ComponentPostCheck = $true
+
+        if ($Selection.Component -eq 'instalarmysql') {
+            $ComponentPostCheck = Test-Path -LiteralPath $DatabaseDirectory -PathType Container
+        }
+
+        if (
+            $SetupExitCode -eq 1 -and
+            $LogLooksComplete -and
+            $UninstallerPresent -and
+            $ComponentPostCheck
+        ) {
+            Write-Log "O processo do instalador retornou código 1, porém o log fechou normalmente e as validações pós-instalação foram aprovadas. O fluxo continuará e o MySQL será validado na próxima etapa." 'AVISO'
+        }
+        else {
+            throw "O instalador terminou com o código $SetupExitCode e as validações pós-instalação não confirmaram uma instalação íntegra. Consulte: $InstallLog"
+        }
+    }
+    else {
+        Write-Log 'Instalação concluída com código 0.' 'OK'
     }
 
-    Write-Log 'Instalação concluída com código 0.' 'OK'
     Write-Log "Log do instalador: $InstallLog"
 
     # O instalador preparado no início é mantido durante toda a sessão.
@@ -567,7 +638,20 @@ function Invoke-NotaJaInstallation {
 # ============================================================
 
 function Test-ProtectedFoldersBeforeReinstallation {
-    if (-not (Test-Path -LiteralPath $NfeDirectory -PathType Container)) {
+    $NfeExists = Test-Path -LiteralPath $NfeDirectory -PathType Container
+    $NfeBackupExists = Test-Path -LiteralPath $NfeBackupDirectory -PathType Container
+
+    if ($NfeExists -and $NfeBackupExists) {
+        throw "As pastas $NfeDirectory e $NfeBackupDirectory existem ao mesmo tempo. A reinstalação foi bloqueada para não sobrescrever nenhum conteúdo."
+    }
+
+    if (-not $NfeExists -and $NfeBackupExists) {
+        Write-Log "Foi encontrada $NfeBackupDirectory sem $NfeDirectory. Restaurando a NFE antes de continuar." 'AVISO'
+        Move-Item -LiteralPath $NfeBackupDirectory -Destination $NfeDirectory -ErrorAction Stop
+        $NfeExists = $true
+    }
+
+    if (-not $NfeExists) {
         throw "A pasta protegida $NfeDirectory não foi encontrada. A reinstalação foi bloqueada para evitar perda de dados."
     }
 
@@ -587,6 +671,56 @@ function Test-ProtectedFoldersBeforeReinstallation {
     }
 
     Write-Log "Pasta protegida confirmada: $NfeDirectory" 'OK'
+}
+
+function Protect-NfeBeforeUninstall {
+    if (-not (Test-Path -LiteralPath $NfeDirectory -PathType Container)) {
+        throw "A pasta $NfeDirectory não existe e não pode ser protegida antes da desinstalação."
+    }
+
+    if (Test-Path -LiteralPath $NfeBackupDirectory) {
+        throw "A pasta temporária de proteção $NfeBackupDirectory já existe. O processo foi bloqueado para evitar sobrescrita."
+    }
+
+    Write-Log "Protegendo a NFE contra o desinstalador: $NfeDirectory -> $NfeBackupDirectory."
+    Move-Item -LiteralPath $NfeDirectory -Destination $NfeBackupDirectory -ErrorAction Stop
+
+    if (-not (Test-Path -LiteralPath $NfeBackupDirectory -PathType Container)) {
+        throw "Não foi possível confirmar a proteção da pasta NFE em $NfeBackupDirectory."
+    }
+
+    Write-Log "Pasta NFE protegida temporariamente em: $NfeBackupDirectory" 'OK'
+}
+
+function Restore-NfeAfterUninstall {
+    if (-not (Test-Path -LiteralPath $NfeBackupDirectory -PathType Container)) {
+        if (Test-Path -LiteralPath $NfeDirectory -PathType Container) {
+            return
+        }
+
+        throw "Nem $NfeDirectory nem $NfeBackupDirectory foram encontradas durante a restauração da NFE."
+    }
+
+    if (Test-Path -LiteralPath $NfeDirectory -PathType Container) {
+        $UnexpectedNfe = Join-Path $WorkDirectory 'NFE-Gerada-Durante-Desinstalacao'
+        $Suffix = 2
+        while (Test-Path -LiteralPath $UnexpectedNfe) {
+            $UnexpectedNfe = Join-Path $WorkDirectory "NFE-Gerada-Durante-Desinstalacao$Suffix"
+            $Suffix++
+        }
+
+        Write-Log "Uma nova $NfeDirectory apareceu durante a desinstalação. Ela será preservada em $UnexpectedNfe antes de restaurar a original." 'AVISO'
+        Move-Item -LiteralPath $NfeDirectory -Destination $UnexpectedNfe -ErrorAction Stop
+    }
+
+    Write-Log "Restaurando a pasta NFE original: $NfeBackupDirectory -> $NfeDirectory."
+    Move-Item -LiteralPath $NfeBackupDirectory -Destination $NfeDirectory -ErrorAction Stop
+
+    if (-not (Test-Path -LiteralPath $NfeDirectory -PathType Container)) {
+        throw "A pasta NFE original não pôde ser restaurada para $NfeDirectory."
+    }
+
+    Write-Log 'Pasta NFE original restaurada após a desinstalação.' 'OK'
 }
 
 function Test-ProtectedFoldersAfterUninstall {
@@ -925,6 +1059,17 @@ function Repair-DatabaseFoldersAfterFailure {
 
     Write-Log 'Foi detectada uma falha com a base preservada em DPCOMPVBKP. Iniciando tentativa de recuperação.' 'AVISO'
 
+    if (-not $ServiceName) {
+        try {
+            $DetectedService = Get-NotaJaMySqlService
+            $ServiceName = $DetectedService.Name
+            Write-Log "Serviço MySQL identificado durante a recuperação: $ServiceName." 'AVISO'
+        }
+        catch {
+            Write-Log "Não foi possível identificar o serviço MySQL durante a recuperação: $($_.Exception.Message)" 'AVISO'
+        }
+    }
+
     if ($ServiceName) {
         try {
             $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -1141,11 +1286,12 @@ function Invoke-Reinstallation {
     Write-Host
     Write-Host 'Este procedimento irá:' -ForegroundColor Yellow
     Write-Host ' - Preservar obrigatoriamente C:\NFE e a base C:\DPCOMPV'
-    Write-Host ' - Desinstalar o NotaJá silenciosamente'
-    Write-Host ' - Fazer um backup completo de C:\DPCOMPV em C:\NotaJaBackup'
+    Write-Host ' - Proteger temporariamente C:\NFE para que o desinstalador não altere seu conteúdo'
+    Write-Host ' - Desinstalar o NotaJá silenciosamente e restaurar C:\NFE em seguida'
+    Write-Host ' - Fazer um backup completo de C:\DPCOMPV em C:\NotaJa-Suporte\Backups\Base'
     Write-Host ' - Renomear a base atual para C:\DPCOMPVBKP'
     Write-Host ' - Remover somente os componentes informados de System32/SysWOW64'
-    Write-Host ' - Baixar e executar novamente o instalador'
+    Write-Host ' - Usar o instalador preparado no início e executar a instalação novamente'
     Write-Host ' - Parar o MySQL, guardar a base nova como DPCOMPVAZIO e restaurar a base original'
     Write-Host
     Write-Host 'O script NÃO exclui C:\NFE, C:\DPCOMPV ou C:\DPCOMPVBKP.' -ForegroundColor Green
@@ -1167,12 +1313,23 @@ function Invoke-Reinstallation {
 
     $MySqlServiceName = $null
     $DatabaseWasMoved = $false
+    $NfeWasProtected = $false
 
     Test-ProtectedFoldersBeforeReinstallation
     Stop-NotaJaApplications
 
     try {
+        # O desinstalador do NotaJá possui entradas que removem arquivos dentro de C:\NFE.
+        # Para garantir que nenhum conteúdo original seja tocado, a pasta é ocultada dele
+        # por meio de um rename temporário e restaurada imediatamente após a desinstalação.
+        Protect-NfeBeforeUninstall
+        $NfeWasProtected = $true
+
         Invoke-NotaJaUninstall
+
+        Restore-NfeAfterUninstall
+        $NfeWasProtected = $false
+
         Test-ProtectedFoldersAfterUninstall
 
         $DatabaseSafetyBackupPath = Backup-DatabaseBeforeReinstallation
@@ -1192,6 +1349,16 @@ function Invoke-Reinstallation {
     }
     catch {
         $OriginalError = $_
+
+        if ($NfeWasProtected -or (Test-Path -LiteralPath $NfeBackupDirectory -PathType Container)) {
+            try {
+                Restore-NfeAfterUninstall
+                $NfeWasProtected = $false
+            }
+            catch {
+                Write-Log "Falha ao restaurar a NFE após erro no fluxo: $($_.Exception.Message)" 'ERRO'
+            }
+        }
 
         if ($DatabaseWasMoved -or (Test-Path -LiteralPath $DatabaseBackupDirectory -PathType Container)) {
             Repair-DatabaseFoldersAfterFailure -ServiceName $MySqlServiceName
@@ -1265,6 +1432,7 @@ Write-Log 'Assistente de suporte iniciado.'
 Write-Log "Usuário: $env:USERDOMAIN\$env:USERNAME"
 Write-Log "Computador: $env:COMPUTERNAME"
 Write-Log "PowerShell: $($PSVersionTable.PSVersion)"
+Write-Log "Pasta central do suporte: $SupportRoot"
 Write-Log "Log da sessão: $SessionLog"
 
 try {
