@@ -600,7 +600,7 @@ function Invoke-NotaJaInstallation {
                 )
             }
             catch {
-                Write-Log "Não foi possível analisar o log do instalador após o código $SetupExitCode: $($_.Exception.Message)" 'AVISO'
+                Write-Log "Não foi possível analisar o log do instalador após o código ${SetupExitCode}: $($_.Exception.Message)" 'AVISO'
             }
         }
 
